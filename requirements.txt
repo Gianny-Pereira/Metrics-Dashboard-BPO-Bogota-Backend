@@ -4,6 +4,8 @@ Flask-Migrate==4.0.7
 Flask-CORS==4.0.1
 python-dotenv==1.0.1
 openpyxl==3.1.5
+requests==2.32.3
 
-# PostgreSQL driver — required in production, not needed for SQLite locally
+# PostgreSQL driver — only needed when DATABASE_URL points to Postgres.
+# If this fails on your machine, install it separately: pip install psycopg2-binary
 psycopg2-binary==2.9.9

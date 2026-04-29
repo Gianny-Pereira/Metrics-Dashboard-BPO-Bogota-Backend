@@ -1,5 +1,26 @@
 # Backend API
 
+## Setup & Running Locally
+
+**Requirements:** Python 3.x, no PostgreSQL installation needed.
+
+```bash
+# 1. Activate the virtual environment
+venv\Scripts\activate.bat
+
+# 2. Install dependencies
+python -m pip install -r requirements.txt
+
+# 3. Run the server
+python -m flask run --port 5000
+```
+
+> **Note:** Always use `python -m flask` instead of `flask` directly to avoid PATH issues inside the venv.
+>
+> `psycopg2-binary` is pinned with `>=` so pip automatically picks a pre-built wheel for your Python version — no manual PostgreSQL install required.
+
+---
+
 Base URL: `http://localhost:5000`
 
 All responses are JSON. Error responses have the shape `{ "error": "..." }`.

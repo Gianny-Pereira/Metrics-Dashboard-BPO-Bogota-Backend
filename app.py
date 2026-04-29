@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_migrate import Migrate
-from sqlalchemy import func, text
+from sqlalchemy import and_, func, or_, text
 
 from models import Client, Landman, Project, Prospect, WorkLog, db
 
@@ -59,13 +59,59 @@ def _normalize_states(raw_states: list[str]) -> list[str]:
     """
     result = []
     for s in raw_states:
-        if s in _STATE_NAME_TO_CODE:          # full name → code
+        if s in _STATE_NAME_TO_CODE:           # full name → code
             result.append(_STATE_NAME_TO_CODE[s])
         elif s.upper() in _STATE_CODE_TO_NAME: # already a code (normalise case)
             result.append(s.upper())
         else:
             result.append(s)                   # unknown — pass through unchanged
     return result
+
+
+def _parse_county_values(raw_counties: list[str]) -> list[tuple[str, str | None]]:
+    """
+    Parse county filter values which may embed a state after a comma:
+      "Fayette"             → ("Fayette", None)
+      "Fayette, PA"         → ("Fayette", "PA")
+      "Fayette, Pennsylvania" → ("Fayette", "PA")  (normalised)
+
+    Returns a list of (county_name, state_code_or_None) pairs.
+    Only county values are split on commas; client values must NOT be passed here.
+    """
+    pairs: list[tuple[str, str | None]] = []
+    for val in raw_counties:
+        if not val:
+            continue
+        if "," in val:
+            county_part, state_raw = val.split(",", 1)
+            county_part = county_part.strip()
+            state_norm = _normalize_states([state_raw.strip()])
+            state_part: str | None = state_norm[0] if state_norm and state_norm[0] else None
+        else:
+            county_part = val.strip()
+            state_part = None
+        if county_part:
+            pairs.append((county_part, state_part))
+    return pairs
+
+
+def _apply_county_filter(query, county_state_pairs: list[tuple[str, str | None]]):
+    """
+    Apply county (+ optional state) filter with OR logic across pairs.
+
+    Each pair becomes:
+      ("Fayette", None) → WorkLog.county == 'Fayette'
+      ("Fayette", "PA") → WorkLog.county == 'Fayette' AND WorkLog.state == 'PA'
+
+    Multiple pairs are OR'd so all requested counties are included.
+    """
+    conditions = []
+    for county, state in county_state_pairs:
+        if state:
+            conditions.append(and_(WorkLog.county == county, WorkLog.state == state))
+        else:
+            conditions.append(WorkLog.county == county)
+    return query.filter(or_(*conditions))
 
 
 app = Flask(__name__)
@@ -243,15 +289,23 @@ def _parse_dashboard_filters():
     Supports repeated query params for every filter (safe for values with commas):
       ?client=Covenant%20Royalties%2C%20LLC&client=Arapahoe%20County%20Clerk
 
+    Client values are NEVER split on commas — a client name may contain commas.
+
     The 'landman' param also accepts a single comma-separated value for
     backward compatibility with callers that have not yet been updated.
 
     State values are normalised from full names ("Pennsylvania") to 2-letter
     abbreviations ("PA") to match the values stored in the DB.
 
+    County values may embed a state:
+      county=Fayette        → filters only by county name
+      county=Fayette, PA    → filters by county name AND state code
+
     Returns:
-        (landman_names, client_names, states, counties, prospect_names)
-        Each is a list[str]; empty list means "no filter on that dimension".
+        (landman_names, client_names, states, county_state_pairs, prospect_names)
+        landman_names, client_names, states, prospect_names → list[str]
+        county_state_pairs → list[tuple[str, str | None]]
+        Empty list means "no filter on that dimension".
     """
     raw_landmen = request.args.getlist("landman")
     if len(raw_landmen) == 1 and "," in raw_landmen[0]:
@@ -259,21 +313,22 @@ def _parse_dashboard_filters():
     else:
         landman_names = [n.strip() for n in raw_landmen if n.strip()]
 
-    client_names   = [n.strip() for n in request.args.getlist("client")   if n.strip()]
-    raw_states     = [n.strip() for n in request.args.getlist("state")    if n.strip()]
-    states         = _normalize_states(raw_states)
-    counties       = [n.strip() for n in request.args.getlist("county")   if n.strip()]
-    prospect_names = [n.strip() for n in request.args.getlist("prospect") if n.strip()]
+    client_names       = [n.strip() for n in request.args.getlist("client")   if n.strip()]
+    raw_states         = [n.strip() for n in request.args.getlist("state")    if n.strip()]
+    states             = _normalize_states(raw_states)
+    raw_counties       = [n.strip() for n in request.args.getlist("county")   if n.strip()]
+    county_state_pairs = _parse_county_values(raw_counties)
+    prospect_names     = [n.strip() for n in request.args.getlist("prospect") if n.strip()]
 
     if DEBUG_FILTERS:
         log.warning(
             "[FILTER] endpoint=%s | landman=%r | client=%r | state_raw=%r "
-            "| state_norm=%r | county=%r | prospect=%r",
+            "| state_norm=%r | county_raw=%r | county_pairs=%r | prospect=%r",
             request.path, landman_names, client_names,
-            raw_states, states, counties, prospect_names,
+            raw_states, states, raw_counties, county_state_pairs, prospect_names,
         )
 
-    return landman_names, client_names, states, counties, prospect_names
+    return landman_names, client_names, states, county_state_pairs, prospect_names
 
 
 def _resolve_date_filter():
@@ -327,7 +382,7 @@ def get_aoi_hours():
     if date_error:
         return date_error
 
-    landman_names, client_names, states, counties, prospect_names = _parse_dashboard_filters()
+    landman_names, client_names, states, county_state_pairs, prospect_names = _parse_dashboard_filters()
 
     query = (
         db.session.query(
@@ -345,8 +400,8 @@ def get_aoi_hours():
         query = query.join(Client, Prospect.client_id == Client.id).filter(Client.name.in_(client_names))
     if states:
         query = query.filter(WorkLog.state.in_(states))
-    if counties:
-        query = query.filter(WorkLog.county.in_(counties))
+    if county_state_pairs:
+        query = _apply_county_filter(query, county_state_pairs)
     rows = query.group_by(Prospect.name).all()
 
     if rows:
@@ -387,7 +442,7 @@ def get_availability():
     if date_error:
         return date_error
 
-    landman_names, client_names, states, counties, prospect_names = _parse_dashboard_filters()
+    landman_names, client_names, states, county_state_pairs, prospect_names = _parse_dashboard_filters()
 
     base_q = (
         db.session.query(WorkLog)
@@ -419,10 +474,10 @@ def get_availability():
         if DEBUG_FILTERS:
             log.warning("[availability] after state filter count=%d (states=%r)", base_q.count(), states)
 
-    if counties:
-        base_q = base_q.filter(WorkLog.county.in_(counties))
+    if county_state_pairs:
+        base_q = _apply_county_filter(base_q, county_state_pairs)
         if DEBUG_FILTERS:
-            log.warning("[availability] after county filter count=%d (counties=%r)", base_q.count(), counties)
+            log.warning("[availability] after county filter count=%d (pairs=%r)", base_q.count(), county_state_pairs)
 
     query = (
         base_q.with_entities(
@@ -448,11 +503,35 @@ def get_availability():
 # Work-log summary  (aggregated hours for pie charts)
 # ---------------------------------------------------------------------------
 
-_SUMMARY_GROUP_BY = {
-    "client": Client.name,
-    "state":  WorkLog.state,
-    "county": WorkLog.county,
-}
+# ---------------------------------------------------------------------------
+# Global date range  (unfiltered — reflects full DB coverage)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/worklogs/date-range")
+def get_worklog_date_range():
+    """
+    Returns the oldest and newest WorkLog date in the entire database.
+    No filters are applied; this always reflects the full data coverage.
+
+    Response:
+      { "min_date": "YYYY-MM-DD", "max_date": "YYYY-MM-DD" }
+      or { "min_date": null, "max_date": null } when the table is empty.
+    """
+    min_date, max_date = db.session.query(
+        func.min(WorkLog.date),
+        func.max(WorkLog.date),
+    ).one()
+    return jsonify({
+        "min_date": min_date.isoformat() if min_date else None,
+        "max_date": max_date.isoformat() if max_date else None,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Work-log summary  (aggregated hours for pie charts)
+# ---------------------------------------------------------------------------
+
+_VALID_GROUP_BY = {"client", "state", "county"}
 
 
 @app.get("/api/worklogs/summary")
@@ -467,25 +546,42 @@ def get_worklogs_summary():
       end_date   : YYYY-MM-DD  (optional, use with start_date for exact range)
       landman    — repeated or comma-separated landman names
       client     — repeated client names
-      state      — repeated state abbreviations
-      county     — repeated county names
+      state      — repeated state names or codes
+      county     — repeated county names (optionally "County, ST")
       prospect   — repeated prospect/AOI names
 
     Response:
-      [ { "label": <value>, "hours": <float> }, ... ]  ordered by hours desc.
+      group_by=client  : [ { "label": <client_name>, "hours": <float> }, ... ]
+      group_by=state   : [ { "label": <state_code>,  "hours": <float> }, ... ]
+      group_by=county  : [ { "label": "County, ST",  "county": <str>,
+                             "state": <str|null>,    "hours": <float> }, ... ]
       Rows where the grouping column is NULL / empty are omitted.
     """
     group_by = request.args.get("group_by", "").strip().lower()
-    if group_by not in _SUMMARY_GROUP_BY:
-        return jsonify({"error": f"group_by must be one of: {', '.join(_SUMMARY_GROUP_BY)}"}), 400
+    if group_by not in _VALID_GROUP_BY:
+        return jsonify({"error": f"group_by must be one of: {', '.join(sorted(_VALID_GROUP_BY))}"}), 400
 
     date_filter, date_error = _resolve_date_filter()
     if date_error:
         return date_error
 
-    landman_names, client_names, states, counties, prospect_names = _parse_dashboard_filters()
+    landman_names, client_names, states, county_state_pairs, prospect_names = _parse_dashboard_filters()
 
-    group_col = _SUMMARY_GROUP_BY[group_by]
+    def _add_shared_filters(q):
+        """Attach landman / client / prospect / state / county filters."""
+        if landman_names:
+            q = q.join(Landman, WorkLog.landman_id == Landman.id).filter(Landman.name.in_(landman_names))
+        if client_names or prospect_names:
+            q = q.join(Prospect, WorkLog.prospect_id == Prospect.id)
+            if prospect_names:
+                q = q.filter(Prospect.name.in_(prospect_names))
+            if client_names:
+                q = q.join(Client, Prospect.client_id == Client.id).filter(Client.name.in_(client_names))
+        if states:
+            q = q.filter(WorkLog.state.in_(states))
+        if county_state_pairs:
+            q = _apply_county_filter(q, county_state_pairs)
+        return q
 
     if group_by == "client":
         query = (
@@ -506,36 +602,58 @@ def get_worklogs_summary():
             query = query.join(Landman, WorkLog.landman_id == Landman.id).filter(Landman.name.in_(landman_names))
         if states:
             query = query.filter(WorkLog.state.in_(states))
-        if counties:
-            query = query.filter(WorkLog.county.in_(counties))
-    else:
+        if county_state_pairs:
+            query = _apply_county_filter(query, county_state_pairs)
+
+        rows = query.order_by(func.sum(WorkLog.hours).desc()).all()
+        return jsonify([
+            {"label": label, "hours": round(float(total), 2)}
+            for label, total in rows
+        ])
+
+    if group_by == "county":
+        # Group by BOTH county and state so "Fayette, PA" and "Fayette, TX"
+        # are counted separately.  Labels are returned as "County, ST".
         query = (
             db.session.query(
-                group_col.label("label"),
+                WorkLog.county,
+                WorkLog.state,
                 func.sum(WorkLog.hours).label("total"),
             )
             .filter(
                 *date_filter,
-                group_col.isnot(None),
-                group_col != "",
+                WorkLog.county.isnot(None),
+                WorkLog.county != "",
             )
-            .group_by(group_col)
+            .group_by(WorkLog.county, WorkLog.state)
         )
-        if landman_names:
-            query = query.join(Landman, WorkLog.landman_id == Landman.id).filter(Landman.name.in_(landman_names))
-        if client_names or prospect_names:
-            query = query.join(Prospect, WorkLog.prospect_id == Prospect.id)
-            if prospect_names:
-                query = query.filter(Prospect.name.in_(prospect_names))
-            if client_names:
-                query = query.join(Client, Prospect.client_id == Client.id).filter(Client.name.in_(client_names))
-        if states:
-            query = query.filter(WorkLog.state.in_(states))
-        if counties:
-            query = query.filter(WorkLog.county.in_(counties))
+        query = _add_shared_filters(query)
+        rows = query.order_by(func.sum(WorkLog.hours).desc()).all()
+        return jsonify([
+            {
+                "label": f"{county}, {state}" if state else county,
+                "county": county,
+                "state": state,
+                "hours": round(float(total), 2),
+            }
+            for county, state, total in rows
+        ])
 
+    # group_by == "state"
+    query = (
+        db.session.query(
+            WorkLog.state.label("label"),
+            func.sum(WorkLog.hours).label("total"),
+        )
+        .filter(
+            *date_filter,
+            WorkLog.state.isnot(None),
+            WorkLog.state != "",
+        )
+        .group_by(WorkLog.state)
+    )
+    query = _add_shared_filters(query)
     rows = query.order_by(func.sum(WorkLog.hours).desc()).all()
-
     return jsonify([
         {"label": label, "hours": round(float(total), 2)}
         for label, total in rows
@@ -622,7 +740,7 @@ def get_warnings():
     if date_error:
         return date_error
 
-    landman_names, client_names, states, counties, prospect_names = _parse_dashboard_filters()
+    landman_names, client_names, states, county_state_pairs, prospect_names = _parse_dashboard_filters()
 
     query = (
         db.session.query(
@@ -644,8 +762,8 @@ def get_warnings():
             query = query.join(Client, Prospect.client_id == Client.id).filter(Client.name.in_(client_names))
     if states:
         query = query.filter(WorkLog.state.in_(states))
-    if counties:
-        query = query.filter(WorkLog.county.in_(counties))
+    if county_state_pairs:
+        query = _apply_county_filter(query, county_state_pairs)
 
     rows = query.order_by(Landman.name, WorkLog.date).all()
 

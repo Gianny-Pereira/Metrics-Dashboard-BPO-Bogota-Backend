@@ -2,6 +2,7 @@ import csv
 import hashlib
 import io
 import json
+import logging
 import os
 import random
 from datetime import date, datetime
@@ -17,6 +18,55 @@ from sqlalchemy import func, text
 from models import Client, Landman, Project, Prospect, WorkLog, db
 
 load_dotenv()
+
+# ---------------------------------------------------------------------------
+# State name ↔ abbreviation mapping
+# The DB stores 2-letter abbreviations (e.g. "PA") because _split_county_state
+# extracts the state from "County, ST" formatted strings.
+# The frontend may send either abbreviations OR full display names; we
+# normalise incoming filter values to abbreviations before querying.
+# ---------------------------------------------------------------------------
+_STATE_NAME_TO_CODE: dict[str, str] = {
+    "Alabama": "AL", "Alaska": "AK", "Arizona": "AZ", "Arkansas": "AR",
+    "California": "CA", "Colorado": "CO", "Connecticut": "CT", "Delaware": "DE",
+    "Florida": "FL", "Georgia": "GA", "Hawaii": "HI", "Idaho": "ID",
+    "Illinois": "IL", "Indiana": "IN", "Iowa": "IA", "Kansas": "KS",
+    "Kentucky": "KY", "Louisiana": "LA", "Maine": "ME", "Maryland": "MD",
+    "Massachusetts": "MA", "Michigan": "MI", "Minnesota": "MN",
+    "Mississippi": "MS", "Missouri": "MO", "Montana": "MT", "Nebraska": "NE",
+    "Nevada": "NV", "New Hampshire": "NH", "New Jersey": "NJ",
+    "New Mexico": "NM", "New York": "NY", "North Carolina": "NC",
+    "North Dakota": "ND", "Ohio": "OH", "Oklahoma": "OK", "Oregon": "OR",
+    "Pennsylvania": "PA", "Rhode Island": "RI", "South Carolina": "SC",
+    "South Dakota": "SD", "Tennessee": "TN", "Texas": "TX", "Utah": "UT",
+    "Vermont": "VT", "Virginia": "VA", "Washington": "WA",
+    "West Virginia": "WV", "Wisconsin": "WI", "Wyoming": "WY",
+    "District of Columbia": "DC",
+}
+
+_STATE_CODE_TO_NAME: dict[str, str] = {v: k for k, v in _STATE_NAME_TO_CODE.items()}
+
+DEBUG_FILTERS = os.getenv("DEBUG_FILTERS", "0") == "1"
+
+log = logging.getLogger(__name__)
+
+
+def _normalize_states(raw_states: list[str]) -> list[str]:
+    """
+    Accept either full state names ("Pennsylvania") or 2-letter codes ("PA")
+    and always return 2-letter codes to match what the DB stores.
+    Values that are already codes or unknown strings are kept as-is.
+    """
+    result = []
+    for s in raw_states:
+        if s in _STATE_NAME_TO_CODE:          # full name → code
+            result.append(_STATE_NAME_TO_CODE[s])
+        elif s.upper() in _STATE_CODE_TO_NAME: # already a code (normalise case)
+            result.append(s.upper())
+        else:
+            result.append(s)                   # unknown — pass through unchanged
+    return result
+
 
 app = Flask(__name__)
 app.config["SQLALCHEMY_DATABASE_URI"] = os.environ["DATABASE_URL"]
@@ -186,6 +236,46 @@ def get_projects():
 # Date-filter helper
 # ---------------------------------------------------------------------------
 
+def _parse_dashboard_filters():
+    """
+    Parse all dashboard filter params from the current request.
+
+    Supports repeated query params for every filter (safe for values with commas):
+      ?client=Covenant%20Royalties%2C%20LLC&client=Arapahoe%20County%20Clerk
+
+    The 'landman' param also accepts a single comma-separated value for
+    backward compatibility with callers that have not yet been updated.
+
+    State values are normalised from full names ("Pennsylvania") to 2-letter
+    abbreviations ("PA") to match the values stored in the DB.
+
+    Returns:
+        (landman_names, client_names, states, counties, prospect_names)
+        Each is a list[str]; empty list means "no filter on that dimension".
+    """
+    raw_landmen = request.args.getlist("landman")
+    if len(raw_landmen) == 1 and "," in raw_landmen[0]:
+        landman_names = [n.strip() for n in raw_landmen[0].split(",") if n.strip()]
+    else:
+        landman_names = [n.strip() for n in raw_landmen if n.strip()]
+
+    client_names   = [n.strip() for n in request.args.getlist("client")   if n.strip()]
+    raw_states     = [n.strip() for n in request.args.getlist("state")    if n.strip()]
+    states         = _normalize_states(raw_states)
+    counties       = [n.strip() for n in request.args.getlist("county")   if n.strip()]
+    prospect_names = [n.strip() for n in request.args.getlist("prospect") if n.strip()]
+
+    if DEBUG_FILTERS:
+        log.warning(
+            "[FILTER] endpoint=%s | landman=%r | client=%r | state_raw=%r "
+            "| state_norm=%r | county=%r | prospect=%r",
+            request.path, landman_names, client_names,
+            raw_states, states, counties, prospect_names,
+        )
+
+    return landman_names, client_names, states, counties, prospect_names
+
+
 def _resolve_date_filter():
     """
     Parse date filtering query params and return (filters, error_response).
@@ -233,10 +323,11 @@ def _resolve_date_filter():
 @app.get("/api/aoi-hours")
 def get_aoi_hours():
     """Average hours per prospect, aggregated from real work-log data."""
-    landman_names = [n.strip() for n in request.args.get("landman", "").split(",") if n.strip()]
     date_filter, date_error = _resolve_date_filter()
     if date_error:
         return date_error
+
+    landman_names, client_names, states, counties, prospect_names = _parse_dashboard_filters()
 
     query = (
         db.session.query(
@@ -244,10 +335,18 @@ def get_aoi_hours():
             func.avg(WorkLog.hours).label("avg_hours"),
         )
         .join(WorkLog, WorkLog.prospect_id == Prospect.id)
+        .filter(*date_filter)
     )
-    query = query.filter(*date_filter)
     if landman_names:
         query = query.join(Landman, WorkLog.landman_id == Landman.id).filter(Landman.name.in_(landman_names))
+    if prospect_names:
+        query = query.filter(Prospect.name.in_(prospect_names))
+    if client_names:
+        query = query.join(Client, Prospect.client_id == Client.id).filter(Client.name.in_(client_names))
+    if states:
+        query = query.filter(WorkLog.state.in_(states))
+    if counties:
+        query = query.filter(WorkLog.county.in_(counties))
     rows = query.group_by(Prospect.name).all()
 
     if rows:
@@ -275,27 +374,66 @@ def get_aoi_hours():
 def get_availability():
     """
     Per-landman hour totals broken down by work_type.
-    Optional query params: ?period=YYYY-MM, ?start_date=YYYY-MM-DD&end_date=YYYY-MM-DD, ?landman=Name1,Name2
+
+    Query params (all optional):
+      period, start_date, end_date  — date range
+      landman   — repeated or comma-separated landman names
+      client    — repeated client names  (?client=A&client=B)
+      state     — repeated state abbreviations
+      county    — repeated county names
+      prospect  — repeated prospect/AOI names
     """
     date_filter, date_error = _resolve_date_filter()
     if date_error:
         return date_error
 
-    landman_names = [n.strip() for n in request.args.get("landman", "").split(",") if n.strip()]
+    landman_names, client_names, states, counties, prospect_names = _parse_dashboard_filters()
+
+    base_q = (
+        db.session.query(WorkLog)
+        .join(Landman, WorkLog.landman_id == Landman.id)
+        .filter(*date_filter)
+    )
+
+    if DEBUG_FILTERS:
+        log.warning("[availability] base count=%d", base_q.count())
+
+    if landman_names:
+        base_q = base_q.filter(Landman.name.in_(landman_names))
+        if DEBUG_FILTERS:
+            log.warning("[availability] after landman filter count=%d", base_q.count())
+
+    if client_names or prospect_names:
+        base_q = base_q.join(Prospect, WorkLog.prospect_id == Prospect.id)
+        if prospect_names:
+            base_q = base_q.filter(Prospect.name.in_(prospect_names))
+            if DEBUG_FILTERS:
+                log.warning("[availability] after prospect filter count=%d", base_q.count())
+        if client_names:
+            base_q = base_q.join(Client, Prospect.client_id == Client.id).filter(Client.name.in_(client_names))
+            if DEBUG_FILTERS:
+                log.warning("[availability] after client filter count=%d", base_q.count())
+
+    if states:
+        base_q = base_q.filter(WorkLog.state.in_(states))
+        if DEBUG_FILTERS:
+            log.warning("[availability] after state filter count=%d (states=%r)", base_q.count(), states)
+
+    if counties:
+        base_q = base_q.filter(WorkLog.county.in_(counties))
+        if DEBUG_FILTERS:
+            log.warning("[availability] after county filter count=%d (counties=%r)", base_q.count(), counties)
 
     query = (
-        db.session.query(
+        base_q.with_entities(
             Landman.id,
             Landman.name,
             WorkLog.work_type,
             func.sum(WorkLog.hours).label("total"),
         )
-        .join(WorkLog, WorkLog.landman_id == Landman.id)
-        .filter(*date_filter)
+        .group_by(Landman.id, Landman.name, WorkLog.work_type)
     )
-    if landman_names:
-        query = query.filter(Landman.name.in_(landman_names))
-    rows = query.group_by(Landman.id, Landman.name, WorkLog.work_type).all()
+    rows = query.all()
 
     summary: dict = {}
     for landman_id, name, work_type, total in rows:
@@ -327,6 +465,11 @@ def get_worklogs_summary():
       period     : YYYY-MM  (optional, defaults to current month)
       start_date : YYYY-MM-DD  (optional, use with end_date for exact range)
       end_date   : YYYY-MM-DD  (optional, use with start_date for exact range)
+      landman    — repeated or comma-separated landman names
+      client     — repeated client names
+      state      — repeated state abbreviations
+      county     — repeated county names
+      prospect   — repeated prospect/AOI names
 
     Response:
       [ { "label": <value>, "hours": <float> }, ... ]  ordered by hours desc.
@@ -340,13 +483,11 @@ def get_worklogs_summary():
     if date_error:
         return date_error
 
-    landman_names = [n.strip() for n in request.args.get("landman", "").split(",") if n.strip()]
+    landman_names, client_names, states, counties, prospect_names = _parse_dashboard_filters()
 
     group_col = _SUMMARY_GROUP_BY[group_by]
 
     if group_by == "client":
-        # Resolve client through the prospect association (inner join keeps only
-        # logs that are tied to a prospect → client).
         query = (
             db.session.query(
                 Client.name.label("label"),
@@ -357,6 +498,16 @@ def get_worklogs_summary():
             .filter(*date_filter)
             .group_by(Client.name)
         )
+        if client_names:
+            query = query.filter(Client.name.in_(client_names))
+        if prospect_names:
+            query = query.filter(Prospect.name.in_(prospect_names))
+        if landman_names:
+            query = query.join(Landman, WorkLog.landman_id == Landman.id).filter(Landman.name.in_(landman_names))
+        if states:
+            query = query.filter(WorkLog.state.in_(states))
+        if counties:
+            query = query.filter(WorkLog.county.in_(counties))
     else:
         query = (
             db.session.query(
@@ -370,9 +521,18 @@ def get_worklogs_summary():
             )
             .group_by(group_col)
         )
-
-    if landman_names:
-        query = query.join(Landman, WorkLog.landman_id == Landman.id).filter(Landman.name.in_(landman_names))
+        if landman_names:
+            query = query.join(Landman, WorkLog.landman_id == Landman.id).filter(Landman.name.in_(landman_names))
+        if client_names or prospect_names:
+            query = query.join(Prospect, WorkLog.prospect_id == Prospect.id)
+            if prospect_names:
+                query = query.filter(Prospect.name.in_(prospect_names))
+            if client_names:
+                query = query.join(Client, Prospect.client_id == Client.id).filter(Client.name.in_(client_names))
+        if states:
+            query = query.filter(WorkLog.state.in_(states))
+        if counties:
+            query = query.filter(WorkLog.county.in_(counties))
 
     rows = query.order_by(func.sum(WorkLog.hours).desc()).all()
 
@@ -462,7 +622,7 @@ def get_warnings():
     if date_error:
         return date_error
 
-    landman_names = [n.strip() for n in request.args.get("landman", "").split(",") if n.strip()]
+    landman_names, client_names, states, counties, prospect_names = _parse_dashboard_filters()
 
     query = (
         db.session.query(
@@ -476,6 +636,16 @@ def get_warnings():
     )
     if landman_names:
         query = query.filter(Landman.name.in_(landman_names))
+    if client_names or prospect_names:
+        query = query.join(Prospect, WorkLog.prospect_id == Prospect.id)
+        if prospect_names:
+            query = query.filter(Prospect.name.in_(prospect_names))
+        if client_names:
+            query = query.join(Client, Prospect.client_id == Client.id).filter(Client.name.in_(client_names))
+    if states:
+        query = query.filter(WorkLog.state.in_(states))
+    if counties:
+        query = query.filter(WorkLog.county.in_(counties))
 
     rows = query.order_by(Landman.name, WorkLog.date).all()
 

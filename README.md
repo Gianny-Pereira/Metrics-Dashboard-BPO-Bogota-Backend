@@ -13,6 +13,7 @@ Flask REST API that powers a workload and productivity metrics dashboard for a l
 5. [Date Logic](#date-logic)
 6. [Endpoints](#endpoints)
    - [GET /api/dashboard](#get-apidashboard) ← preferred for frontend
+   - [GET /api/experience-by-state](#get-apiexperience-by-state)
    - [GET /api/availability](#get-apiavailability)
    - [GET /api/worklogs/summary](#get-apiworklogssummary)
    - [GET /api/aoi-hours](#get-apiaoi-hours)
@@ -219,6 +220,130 @@ Each section uses the same calculation and response shape as the corresponding i
 
 ---
 
+### GET /api/experience-by-state
+
+Identifies landmen with a minimum amount of experience in a specific state, calculated from the **date span** of their work (not just total hours logged).
+
+#### Experience calculation
+
+For each landman in the selected state (within the applied date range):
+
+```
+first_work_date   = earliest WorkLog.date matching all filters
+last_work_date    = latest  WorkLog.date matching all filters
+experience_days   = (last_work_date − first_work_date).days + 1   ← inclusive
+experience_months = experience_days / 30.4375
+```
+
+#### Threshold and tolerance
+
+```
+effective_min_months = max(0, min_months − tolerance_months)
+qualified            = experience_months >= effective_min_months
+```
+
+**Example:** `min_months=3`, `tolerance_months=0.5` → `effective_min_months=2.5`. Landmen with ≥ 2.5 months in the state qualify.
+
+#### Parameters
+
+| Param | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `state` | **yes** | — | Two-letter code (`PA`) or full name (`Pennsylvania`). Both are normalised. |
+| `min_months` | no | `3` | Minimum months of experience required. |
+| `tolerance_months` | no | `0` | Tolerance subtracted from `min_months`. Cannot make effective threshold negative. |
+| `team` | no | — | `BPO` or `TLS` — same as all other dashboard endpoints. |
+| `landman` | no | — | Filter to specific landmen. |
+| `client` | no | — | Filter to work logs tied to a specific client. |
+| `county` | no | — | Filter by county, e.g. `Fayette` or `Fayette, PA`. |
+| `prospect` | no | — | Filter to a specific prospect/AOI. |
+| `period` | no | current month | `YYYY-MM` calendar month. |
+| `start_date` | no | — | `YYYY-MM-DD` start of date range (use with `end_date`). |
+| `end_date` | no | — | `YYYY-MM-DD` end of date range (use with `start_date`). |
+
+Date filter priority: `start_date`/`end_date` → `period` → current calendar month.
+
+Experience is calculated **only from work logs that fall within the applied date range** — the date filter applies fully.
+
+#### Examples
+
+```
+# Basic — all landmen in PA, current month, default 3-month threshold
+GET /api/experience-by-state?state=PA
+
+# Full state name (same result)
+GET /api/experience-by-state?state=Pennsylvania
+
+# Custom threshold with tolerance
+GET /api/experience-by-state?state=PA&min_months=3&tolerance_months=0.5
+
+# BPO only
+GET /api/experience-by-state?state=PA&team=BPO
+
+# Specific client + date range
+GET /api/experience-by-state?state=PA&client=Arch%20Energy%20Management&start_date=2026-01-01&end_date=2026-03-31
+
+# County with state
+GET /api/experience-by-state?state=PA&county=Fayette%2C%20PA
+```
+
+#### Response `200`
+
+Results include **both qualified and non-qualified landmen**. Sorting: qualified first, then by `experience_months` descending, then by `total_hours` descending.
+
+```json
+{
+  "state": "PA",
+  "state_label": "Pennsylvania",
+  "min_months": 3,
+  "tolerance_months": 0.5,
+  "effective_min_months": 2.5,
+  "date_range": {
+    "start_date": "2026-01-01",
+    "end_date": "2026-03-31"
+  },
+  "results": [
+    {
+      "landman": "A Criollo",
+      "team": "BPO",
+      "state": "PA",
+      "first_work_date": "2026-01-10",
+      "last_work_date": "2026-03-25",
+      "experience_days": 75,
+      "experience_months": 2.46,
+      "total_hours": 148.5,
+      "clients": ["Arch Energy Management"],
+      "prospects": ["AOI North", "Land Admin"],
+      "client_count": 1,
+      "prospect_count": 2,
+      "qualified": false
+    }
+  ]
+}
+```
+
+Each result row includes:
+
+| Field | Description |
+|-------|-------------|
+| `clients` | Sorted list of unique client names from the filtered work logs for that landman/state. |
+| `prospects` | Sorted list of unique prospect names from the filtered work logs for that landman/state. |
+| `client_count` | Number of unique clients (`len(clients)`). |
+| `prospect_count` | Number of unique prospects (`len(prospects)`). |
+
+These lists respect all active filters — `client`, `prospect`, `team`, `landman`, `county`, and the date range — so they always reflect exactly the same dataset used to compute experience dates and hours.
+
+Returns `"results": []` when no work logs match the filters — the response envelope is always present.
+
+#### Response `400`
+
+```json
+{ "error": "state is required" }
+```
+
+Returned when the `state` param is missing or empty.
+
+---
+
 ### GET /api/availability
 
 Per-landman hour totals broken down by `work_type`. Accepts all filter params.
@@ -413,6 +538,33 @@ curl "http://localhost:5000/api/dashboard?team=BPO"
 
 # Dashboard — TLS team only
 curl "http://localhost:5000/api/dashboard?team=TLS"
+
+# Experience by state — missing state (expect 400)
+curl "http://localhost:5000/api/experience-by-state"
+
+# Experience by state — basic
+curl "http://localhost:5000/api/experience-by-state?state=PA"
+
+# Experience by state — full state name
+curl "http://localhost:5000/api/experience-by-state?state=Pennsylvania"
+
+# Experience by state — threshold with tolerance
+curl "http://localhost:5000/api/experience-by-state?state=PA&min_months=3&tolerance_months=0.5"
+
+# Experience by state — BPO only
+curl "http://localhost:5000/api/experience-by-state?state=PA&team=BPO"
+
+# Experience by state — date range
+curl "http://localhost:5000/api/experience-by-state?state=PA&start_date=2026-01-01&end_date=2026-03-31"
+
+# Experience by state — client filter
+curl "http://localhost:5000/api/experience-by-state?state=PA&client=Arch%20Energy%20Management"
+
+# Experience by state — county with state embedded
+curl "http://localhost:5000/api/experience-by-state?state=PA&county=Fayette%2C%20PA"
+
+# Experience by state — combined filters
+curl "http://localhost:5000/api/experience-by-state?state=PA&team=BPO&client=Arch%20Energy%20Management&min_months=3&tolerance_months=0.5&start_date=2026-03-01&end_date=2026-03-31"
 
 # Dashboard — BPO + specific client
 curl "http://localhost:5000/api/dashboard?team=BPO&client=Arch%20Energy%20Management"

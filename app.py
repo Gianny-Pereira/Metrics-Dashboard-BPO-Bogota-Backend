@@ -6,7 +6,7 @@ import logging
 import os
 import random
 import unicodedata
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import openpyxl
 
@@ -450,6 +450,44 @@ def _resolve_date_filter():
         func.extract("year", WorkLog.date) == year,
         func.extract("month", WorkLog.date) == month,
     ], None
+
+
+def _parse_float_param(name: str, default: float) -> float:
+    """Parse a float query param, returning default if absent or invalid."""
+    raw = request.args.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except (ValueError, TypeError):
+        return default
+
+
+def _date_range_for_response() -> dict:
+    """
+    Return the applied date range as {start_date, end_date} strings.
+    Mirrors the priority logic in _resolve_date_filter() for the response body.
+    """
+    start_raw = request.args.get("start_date")
+    end_raw = request.args.get("end_date")
+    if start_raw and end_raw:
+        return {"start_date": start_raw, "end_date": end_raw}
+
+    period = request.args.get("period")
+    try:
+        if period:
+            year, month = map(int, period.split("-"))
+        else:
+            today = date.today()
+            year, month = today.year, today.month
+    except (ValueError, AttributeError):
+        today = date.today()
+        year, month = today.year, today.month
+
+    period_start = date(year, month, 1)
+    period_end = date(year + 1, 1, 1) - timedelta(days=1) if month == 12 \
+        else date(year, month + 1, 1) - timedelta(days=1)
+    return {"start_date": period_start.isoformat(), "end_date": period_end.isoformat()}
 
 
 # ---------------------------------------------------------------------------
@@ -1149,6 +1187,154 @@ def get_dashboard():
             "project_hours": project_hours,
             "productivity_percent": productivity_percent,
         },
+    })
+
+
+# ---------------------------------------------------------------------------
+# Experience by state
+# ---------------------------------------------------------------------------
+
+_DAYS_PER_MONTH = 30.4375
+
+
+@app.get("/api/experience-by-state")
+def get_experience_by_state():
+    """
+    For a required state, return every landman's experience span (first → last
+    work date in that state within the filtered date range) and whether they
+    meet the minimum experience threshold.
+
+    Query params:
+      state             (required) — two-letter code or full name, e.g. PA / Pennsylvania
+      min_months        (optional, default 3)   — minimum months threshold
+      tolerance_months  (optional, default 0)   — tolerance subtracted from min_months
+      team, landman, client, county, prospect,
+      period, start_date, end_date              — same as /api/dashboard filters
+
+    effective_min_months = max(0, min_months - tolerance_months)
+    experience_days      = (last_work_date - first_work_date).days + 1  (inclusive)
+    experience_months    = experience_days / 30.4375
+
+    Returns qualified and non-qualified landmen, qualified first, then sorted
+    by experience_months desc, then total_hours desc.
+    """
+    # --- Required: state -------------------------------------------------
+    raw_state = request.args.get("state", "").strip()
+    if not raw_state:
+        return jsonify({"error": "state is required"}), 400
+
+    state_code = _normalize_states([raw_state])[0]
+    state_label = _STATE_CODE_TO_NAME.get(state_code, state_code)
+
+    # --- Optional: threshold params --------------------------------------
+    min_months = _parse_float_param("min_months", 3.0)
+    tolerance_months = _parse_float_param("tolerance_months", 0.0)
+    effective_min_months = max(0.0, min_months - tolerance_months)
+
+    # --- Date filter -----------------------------------------------------
+    date_filter, date_error = _resolve_date_filter()
+    if date_error:
+        return date_error
+
+    # --- Shared dashboard filters ----------------------------------------
+    # _parse_dashboard_filters() will read the 'state' param too, but we apply
+    # state separately as the primary filter and ignore _states here.
+    landman_names, client_names, _states, county_state_pairs, prospect_names = _parse_dashboard_filters()
+    selected_teams = _parse_team_filter()
+    effective_landmen, restrict_landmen = _resolve_landman_filter(selected_teams, landman_names)
+
+    # --- Query: one pass — fetch rows with client/prospect names ---------
+    # Outerjoin Prospect + Client so rows without a prospect still appear.
+    # When client_names/prospect_names filters are active the WHERE clause on
+    # the outer-joined table naturally restricts to matching rows only.
+    query = (
+        db.session.query(
+            Landman.name,
+            WorkLog.date,
+            WorkLog.hours,
+            Client.name.label("client_name"),
+            Prospect.name.label("prospect_name"),
+        )
+        .join(Landman, WorkLog.landman_id == Landman.id)
+        .outerjoin(Prospect, WorkLog.prospect_id == Prospect.id)
+        .outerjoin(Client, Prospect.client_id == Client.id)
+        .filter(*date_filter)
+        .filter(WorkLog.state == state_code)
+    )
+
+    if restrict_landmen:
+        if effective_landmen:
+            query = query.filter(Landman.name.in_(effective_landmen))
+        else:
+            query = query.filter(text("1=0"))
+
+    if prospect_names:
+        query = query.filter(Prospect.name.in_(prospect_names))
+    if client_names:
+        query = query.filter(Client.name.in_(client_names))
+
+    if county_state_pairs:
+        query = _apply_county_filter(query, county_state_pairs)
+
+    rows = query.all()
+
+    # --- Aggregate per landman in a single Python pass -------------------
+    agg: dict[str, dict] = {}
+    for lm_name, wl_date, wl_hours, client_name, prospect_name in rows:
+        if lm_name not in agg:
+            agg[lm_name] = {
+                "first_date": wl_date,
+                "last_date": wl_date,
+                "total_hours": 0.0,
+                "clients": set(),
+                "prospects": set(),
+            }
+        entry = agg[lm_name]
+        if wl_date < entry["first_date"]:
+            entry["first_date"] = wl_date
+        if wl_date > entry["last_date"]:
+            entry["last_date"] = wl_date
+        entry["total_hours"] += float(wl_hours)
+        if client_name:
+            entry["clients"].add(client_name)
+        if prospect_name:
+            entry["prospects"].add(prospect_name)
+
+    # --- Build results ---------------------------------------------------
+    results = []
+    for name, entry in agg.items():
+        first_date = entry["first_date"]
+        last_date = entry["last_date"]
+        experience_days = (last_date - first_date).days + 1
+        experience_months = round(experience_days / _DAYS_PER_MONTH, 2)
+        clients_sorted = sorted(entry["clients"])
+        prospects_sorted = sorted(entry["prospects"])
+        results.append({
+            "landman": name,
+            "team": get_landman_team(name),
+            "state": state_code,
+            "first_work_date": first_date.isoformat(),
+            "last_work_date": last_date.isoformat(),
+            "experience_days": experience_days,
+            "experience_months": experience_months,
+            "total_hours": round(entry["total_hours"], 2),
+            "clients": clients_sorted,
+            "prospects": prospects_sorted,
+            "client_count": len(clients_sorted),
+            "prospect_count": len(prospects_sorted),
+            "qualified": experience_months >= effective_min_months,
+        })
+
+    results.sort(key=lambda r: (0 if r["qualified"] else 1, -r["experience_months"], -r["total_hours"]))
+
+    return jsonify({
+        "state": state_code,
+        "state_label": state_label,
+        "min_months": min_months,
+        "tolerance_months": tolerance_months,
+        "effective_min_months": round(effective_min_months, 4),
+        "date_range": _date_range_for_response(),
+        "results": results,
     })
 
 

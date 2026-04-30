@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import random
+import unicodedata
 from datetime import date, datetime
 
 import openpyxl
@@ -47,6 +48,48 @@ _STATE_NAME_TO_CODE: dict[str, str] = {
 _STATE_CODE_TO_NAME: dict[str, str] = {v: k for k, v in _STATE_NAME_TO_CODE.items()}
 
 DEBUG_FILTERS = os.getenv("DEBUG_FILTERS", "0") == "1"
+
+# ---------------------------------------------------------------------------
+# BPO / TLS team classification
+# ---------------------------------------------------------------------------
+
+BPO_LANDMAN_NAMES: frozenset[str] = frozenset({
+    "A Camargo", "A Criollo", "A Guerra", "A Lopez", "A Lorenzo",
+    "C Castellanos", "C Lara", "C Mesa",
+    "D Chinchilla", "D Trujillo",
+    "F Montañez",
+    "G Cardozo", "G Murillo", "G Pereira", "G Tabima",
+    "H Daza",
+    "I De La Parra", "I Salamanca",
+    "J Abay", "J Castillo", "J Gonzalez", "J Macias", "J Ramos",
+    "J Reyes", "J Rincon", "J S Bermudez", "J Valbuena",
+    "K Martínez",
+    "L Alfonso", "L Diaz", "L Escobar", "L Silva", "L Villamil",
+    "M Fernandez", "M Grazziani", "M Leon", "M Lopez", "M Verdooren",
+    "N Espitia", "N Lozano",
+    "O Moreno",
+    "R Camelo", "R Sanchez",
+    "S Calderon", "S Romero",
+    "T Vargas",
+})
+
+
+def normalize_landman_name(name: str) -> str:
+    """Lowercase, trim, collapse spaces, strip diacritics — for classification only, not display."""
+    s = " ".join(name.strip().lower().split())
+    s = unicodedata.normalize("NFD", s)
+    return "".join(c for c in s if unicodedata.category(c) != "Mn")
+
+
+_BPO_NORMALIZED: frozenset[str] = frozenset(normalize_landman_name(n) for n in BPO_LANDMAN_NAMES)
+
+
+def is_bpo_landman(name: str) -> bool:
+    return normalize_landman_name(name) in _BPO_NORMALIZED
+
+
+def get_landman_team(name: str) -> str:
+    return "BPO" if is_bpo_landman(name) else "TLS"
 
 log = logging.getLogger(__name__)
 
@@ -114,6 +157,51 @@ def _apply_county_filter(query, county_state_pairs: list[tuple[str, str | None]]
     return query.filter(or_(*conditions))
 
 
+def _parse_team_filter() -> list[str]:
+    """Parse ?team=BPO and/or ?team=TLS params. Returns list of validated team strings."""
+    return [t.strip().upper() for t in request.args.getlist("team")
+            if t.strip().upper() in ("BPO", "TLS")]
+
+
+def _resolve_landman_filter(selected_teams: list[str], explicit_names: list[str]):
+    """
+    Combine team filter and explicit landman name filter into a final effective filter.
+
+    Returns (effective_names, restrict) where:
+      restrict=False  → no landman restriction; include all landmen
+      restrict=True, effective_names non-empty → restrict to these canonical DB names
+      restrict=True, effective_names=[]        → impossible condition (force 0 rows)
+
+    Team logic:
+      BPO only   → landmen whose name normalises to the BPO list
+      TLS only   → landmen whose name does NOT normalise to the BPO list
+      Both/neither → no team restriction (explicit landman filter still applies)
+    """
+    both_teams = {"BPO", "TLS"}
+    team_set = set(selected_teams)
+    active_team = bool(selected_teams) and not (team_set >= both_teams)
+
+    if not active_team and not explicit_names:
+        return [], False
+
+    if not active_team:
+        return explicit_names, True
+
+    # Team filter active — classify every landman currently in the DB
+    all_db_names: list[str] = [r[0] for r in Landman.query.with_entities(Landman.name).all()]
+    if "BPO" in team_set:
+        team_names = [n for n in all_db_names if is_bpo_landman(n)]
+    else:
+        team_names = [n for n in all_db_names if not is_bpo_landman(n)]
+
+    if not explicit_names:
+        return team_names, True
+
+    # Intersect explicit names with team names using normalised comparison
+    team_norm = {normalize_landman_name(n) for n in team_names}
+    return [n for n in explicit_names if normalize_landman_name(n) in team_norm], True
+
+
 app = Flask(__name__)
 app.config["SQLALCHEMY_DATABASE_URI"] = os.environ["DATABASE_URL"]
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
@@ -126,16 +214,6 @@ migrate = Migrate(app, db)
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def _get_or_create(model, **kwargs):
-    """Return existing row or create a new one (keyed by all kwargs)."""
-    instance = model.query.filter_by(**kwargs).first()
-    if not instance:
-        instance = model(**kwargs)
-        db.session.add(instance)
-        db.session.flush()  # get the id without a full commit
-    return instance
-
 
 def _parse_date(value: str) -> date:
     """Accept M/D/YYYY, MM/DD/YYYY, or YYYY-MM-DD."""
@@ -172,7 +250,10 @@ def _split_county_state(value: str) -> tuple[str | None, str | None]:
 @app.get("/api/landmen")
 def get_landmen():
     landmen = Landman.query.order_by(Landman.name).all()
-    return jsonify([l.to_dict() for l in landmen])
+    return jsonify([
+        {**l.to_dict(), "team": get_landman_team(l.name)}
+        for l in landmen
+    ])
 
 
 @app.get("/api/landmen/<int:landman_id>/worklogs")
@@ -383,6 +464,8 @@ def get_aoi_hours():
         return date_error
 
     landman_names, client_names, states, county_state_pairs, prospect_names = _parse_dashboard_filters()
+    selected_teams = _parse_team_filter()
+    effective_landmen, restrict_landmen = _resolve_landman_filter(selected_teams, landman_names)
 
     query = (
         db.session.query(
@@ -392,8 +475,12 @@ def get_aoi_hours():
         .join(WorkLog, WorkLog.prospect_id == Prospect.id)
         .filter(*date_filter)
     )
-    if landman_names:
-        query = query.join(Landman, WorkLog.landman_id == Landman.id).filter(Landman.name.in_(landman_names))
+    if restrict_landmen:
+        query = query.join(Landman, WorkLog.landman_id == Landman.id)
+        if effective_landmen:
+            query = query.filter(Landman.name.in_(effective_landmen))
+        else:
+            query = query.filter(text("1=0"))
     if prospect_names:
         query = query.filter(Prospect.name.in_(prospect_names))
     if client_names:
@@ -443,6 +530,8 @@ def get_availability():
         return date_error
 
     landman_names, client_names, states, county_state_pairs, prospect_names = _parse_dashboard_filters()
+    selected_teams = _parse_team_filter()
+    effective_landmen, restrict_landmen = _resolve_landman_filter(selected_teams, landman_names)
 
     base_q = (
         db.session.query(WorkLog)
@@ -453,10 +542,13 @@ def get_availability():
     if DEBUG_FILTERS:
         log.warning("[availability] base count=%d", base_q.count())
 
-    if landman_names:
-        base_q = base_q.filter(Landman.name.in_(landman_names))
+    if restrict_landmen:
+        if effective_landmen:
+            base_q = base_q.filter(Landman.name.in_(effective_landmen))
+        else:
+            base_q = base_q.filter(text("1=0"))
         if DEBUG_FILTERS:
-            log.warning("[availability] after landman filter count=%d", base_q.count())
+            log.warning("[availability] after landman/team filter count=%d", base_q.count())
 
     if client_names or prospect_names:
         base_q = base_q.join(Prospect, WorkLog.prospect_id == Prospect.id)
@@ -498,10 +590,6 @@ def get_availability():
 
     return jsonify(list(summary.values()))
 
-
-# ---------------------------------------------------------------------------
-# Work-log summary  (aggregated hours for pie charts)
-# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Global date range  (unfiltered — reflects full DB coverage)
@@ -566,11 +654,17 @@ def get_worklogs_summary():
         return date_error
 
     landman_names, client_names, states, county_state_pairs, prospect_names = _parse_dashboard_filters()
+    selected_teams = _parse_team_filter()
+    effective_landmen, restrict_landmen = _resolve_landman_filter(selected_teams, landman_names)
 
     def _add_shared_filters(q):
         """Attach landman / client / prospect / state / county filters."""
-        if landman_names:
-            q = q.join(Landman, WorkLog.landman_id == Landman.id).filter(Landman.name.in_(landman_names))
+        if restrict_landmen:
+            q = q.join(Landman, WorkLog.landman_id == Landman.id)
+            if effective_landmen:
+                q = q.filter(Landman.name.in_(effective_landmen))
+            else:
+                q = q.filter(text("1=0"))
         if client_names or prospect_names:
             q = q.join(Prospect, WorkLog.prospect_id == Prospect.id)
             if prospect_names:
@@ -598,8 +692,12 @@ def get_worklogs_summary():
             query = query.filter(Client.name.in_(client_names))
         if prospect_names:
             query = query.filter(Prospect.name.in_(prospect_names))
-        if landman_names:
-            query = query.join(Landman, WorkLog.landman_id == Landman.id).filter(Landman.name.in_(landman_names))
+        if restrict_landmen:
+            query = query.join(Landman, WorkLog.landman_id == Landman.id)
+            if effective_landmen:
+                query = query.filter(Landman.name.in_(effective_landmen))
+            else:
+                query = query.filter(text("1=0"))
         if states:
             query = query.filter(WorkLog.state.in_(states))
         if county_state_pairs:
@@ -741,6 +839,8 @@ def get_warnings():
         return date_error
 
     landman_names, client_names, states, county_state_pairs, prospect_names = _parse_dashboard_filters()
+    selected_teams = _parse_team_filter()
+    effective_landmen, restrict_landmen = _resolve_landman_filter(selected_teams, landman_names)
 
     query = (
         db.session.query(
@@ -752,8 +852,11 @@ def get_warnings():
         .filter(*date_filter)
         .group_by(Landman.name, WorkLog.date)
     )
-    if landman_names:
-        query = query.filter(Landman.name.in_(landman_names))
+    if restrict_landmen:
+        if effective_landmen:
+            query = query.filter(Landman.name.in_(effective_landmen))
+        else:
+            query = query.filter(text("1=0"))
     if client_names or prospect_names:
         query = query.join(Prospect, WorkLog.prospect_id == Prospect.id)
         if prospect_names:
@@ -780,6 +883,273 @@ def get_warnings():
         })
 
     return jsonify(result)
+
+
+# ---------------------------------------------------------------------------
+# Consolidated dashboard  (single request replaces 6 individual calls)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/dashboard")
+def get_dashboard():
+    """
+    Returns all dashboard data in one response.
+
+    Accepts the same query params as the individual dashboard endpoints:
+      team, landman, client, state, county, prospect,
+      period, start_date, end_date
+
+    Response shape:
+      {
+        "availability": [...],          same as GET /api/availability
+        "summary": {
+          "client":  [...],             same as GET /api/worklogs/summary?group_by=client
+          "state":   [...],             same as GET /api/worklogs/summary?group_by=state
+          "county":  [...]              same as GET /api/worklogs/summary?group_by=county
+        },
+        "aoi_hours": [...],             same as GET /api/aoi-hours
+        "warnings":  [...],             same as GET /api/warnings
+        "totals": {
+          "total_hours": float,         sum of all filtered hours (derived from availability, no extra query)
+          "project_hours": float,       hours tied to a project record
+          "productivity_percent": float
+        }
+      }
+    """
+    # ── Resolve all filters once ───────────────────────────────────────────────
+    date_filter, date_error = _resolve_date_filter()
+    if date_error:
+        return date_error
+
+    landman_names, client_names, states, county_state_pairs, prospect_names = _parse_dashboard_filters()
+    selected_teams = _parse_team_filter()
+    effective_landmen, restrict_landmen = _resolve_landman_filter(selected_teams, landman_names)
+
+    # ── Shared micro-helpers (closures over resolved filter vars) ──────────────
+
+    def _lm(q):
+        """Apply landman/team restriction. Caller must have already joined Landman."""
+        if not restrict_landmen:
+            return q
+        if effective_landmen:
+            return q.filter(Landman.name.in_(effective_landmen))
+        return q.filter(text("1=0"))
+
+    def _pc(q):
+        """Conditionally join Prospect + Client and apply name filters."""
+        if client_names or prospect_names:
+            q = q.join(Prospect, WorkLog.prospect_id == Prospect.id)
+            if prospect_names:
+                q = q.filter(Prospect.name.in_(prospect_names))
+            if client_names:
+                q = q.join(Client, Prospect.client_id == Client.id).filter(Client.name.in_(client_names))
+        return q
+
+    def _sc(q):
+        """Apply state + county filters."""
+        if states:
+            q = q.filter(WorkLog.state.in_(states))
+        if county_state_pairs:
+            q = _apply_county_filter(q, county_state_pairs)
+        return q
+
+    # ── 1. AVAILABILITY ────────────────────────────────────────────────────────
+    avail_base = (
+        db.session.query(WorkLog)
+        .join(Landman, WorkLog.landman_id == Landman.id)
+        .filter(*date_filter)
+    )
+    avail_base = _lm(avail_base)
+    avail_base = _pc(avail_base)
+    avail_base = _sc(avail_base)
+
+    avail_rows = (
+        avail_base
+        .with_entities(
+            Landman.id,
+            Landman.name,
+            WorkLog.work_type,
+            func.sum(WorkLog.hours).label("total"),
+        )
+        .group_by(Landman.id, Landman.name, WorkLog.work_type)
+        .all()
+    )
+
+    avail_map: dict = {}
+    for lm_id, name, work_type, total in avail_rows:
+        if lm_id not in avail_map:
+            avail_map[lm_id] = {"id": lm_id, "name": name}
+        avail_map[lm_id][work_type] = float(total)
+    availability = list(avail_map.values())
+
+    # Derive total_hours from already-fetched availability (zero extra queries)
+    total_hours = sum(
+        v for entry in availability
+        for k, v in entry.items()
+        if k not in ("id", "name") and isinstance(v, (int, float))
+    )
+
+    # ── 2. SUMMARY: CLIENT ────────────────────────────────────────────────────
+    # Client + Prospect must be in the FROM clause for grouping, so Landman is
+    # joined conditionally rather than through the shared _lm helper.
+    client_q = (
+        db.session.query(
+            Client.name.label("label"),
+            func.sum(WorkLog.hours).label("total"),
+        )
+        .join(Prospect, WorkLog.prospect_id == Prospect.id)
+        .join(Client, Prospect.client_id == Client.id)
+        .filter(*date_filter)
+        .group_by(Client.name)
+    )
+    if restrict_landmen:
+        client_q = client_q.join(Landman, WorkLog.landman_id == Landman.id)
+        if effective_landmen:
+            client_q = client_q.filter(Landman.name.in_(effective_landmen))
+        else:
+            client_q = client_q.filter(text("1=0"))
+    if client_names:
+        client_q = client_q.filter(Client.name.in_(client_names))
+    if prospect_names:
+        client_q = client_q.filter(Prospect.name.in_(prospect_names))
+    client_q = _sc(client_q)
+    summary_client = [
+        {"label": label, "hours": round(float(total), 2)}
+        for label, total in client_q.order_by(func.sum(WorkLog.hours).desc()).all()
+    ]
+
+    # ── 3. SUMMARY: STATE ─────────────────────────────────────────────────────
+    state_q = (
+        db.session.query(
+            WorkLog.state.label("label"),
+            func.sum(WorkLog.hours).label("total"),
+        )
+        .join(Landman, WorkLog.landman_id == Landman.id)
+        .filter(*date_filter, WorkLog.state.isnot(None), WorkLog.state != "")
+        .group_by(WorkLog.state)
+    )
+    state_q = _lm(state_q)
+    state_q = _pc(state_q)
+    state_q = _sc(state_q)
+    summary_state = [
+        {"label": label, "hours": round(float(total), 2)}
+        for label, total in state_q.order_by(func.sum(WorkLog.hours).desc()).all()
+    ]
+
+    # ── 4. SUMMARY: COUNTY ────────────────────────────────────────────────────
+    county_q = (
+        db.session.query(
+            WorkLog.county,
+            WorkLog.state,
+            func.sum(WorkLog.hours).label("total"),
+        )
+        .join(Landman, WorkLog.landman_id == Landman.id)
+        .filter(*date_filter, WorkLog.county.isnot(None), WorkLog.county != "")
+        .group_by(WorkLog.county, WorkLog.state)
+    )
+    county_q = _lm(county_q)
+    county_q = _pc(county_q)
+    county_q = _sc(county_q)
+    summary_county = [
+        {
+            "label": f"{county}, {state}" if state else county,
+            "county": county,
+            "state": state,
+            "hours": round(float(total), 2),
+        }
+        for county, state, total in county_q.order_by(func.sum(WorkLog.hours).desc()).all()
+    ]
+
+    # ── 5. AOI HOURS ──────────────────────────────────────────────────────────
+    aoi_q = (
+        db.session.query(
+            Prospect.name,
+            func.avg(WorkLog.hours).label("avg_hours"),
+        )
+        .join(WorkLog, WorkLog.prospect_id == Prospect.id)
+        .filter(*date_filter)
+    )
+    if restrict_landmen:
+        aoi_q = aoi_q.join(Landman, WorkLog.landman_id == Landman.id)
+        if effective_landmen:
+            aoi_q = aoi_q.filter(Landman.name.in_(effective_landmen))
+        else:
+            aoi_q = aoi_q.filter(text("1=0"))
+    if prospect_names:
+        aoi_q = aoi_q.filter(Prospect.name.in_(prospect_names))
+    if client_names:
+        aoi_q = aoi_q.join(Client, Prospect.client_id == Client.id).filter(Client.name.in_(client_names))
+    aoi_q = _sc(aoi_q)
+    aoi_rows = aoi_q.group_by(Prospect.name).all()
+
+    if aoi_rows:
+        aoi_hours = [
+            {"prospect": name, "avgHours": round(float(avg), 2)}
+            for name, avg in aoi_rows
+        ]
+    else:
+        clients_fb = Client.query.order_by(Client.name).all()
+        rng = random.Random(42)
+        aoi_hours = [
+            {"prospect": c.name, "avgHours": round(rng.uniform(5, 50), 2)}
+            for c in clients_fb
+        ]
+
+    # ── 6. WARNINGS ───────────────────────────────────────────────────────────
+    warn_q = (
+        db.session.query(
+            Landman.name,
+            WorkLog.date,
+            func.sum(WorkLog.hours).label("total"),
+        )
+        .join(Landman, WorkLog.landman_id == Landman.id)
+        .filter(*date_filter)
+        .group_by(Landman.name, WorkLog.date)
+    )
+    warn_q = _lm(warn_q)
+    warn_q = _pc(warn_q)
+    warn_q = _sc(warn_q)
+
+    warnings = []
+    for name, log_date, day_total in warn_q.order_by(Landman.name, WorkLog.date).all():
+        day_hours = round(float(day_total), 3)
+        if abs(day_hours - 8.0) < 0.001:
+            continue
+        warnings.append({
+            "landman": name,
+            "date": log_date.isoformat(),
+            "total": day_hours,
+            "status": "incomplete" if day_hours < 8.0 else "over",
+        })
+
+    # ── 7. TOTALS ─────────────────────────────────────────────────────────────
+    # total_hours is already computed in-memory from availability (no extra query).
+    # project_hours requires one targeted query (hours where project_id IS NOT NULL).
+    proj_q = (
+        db.session.query(func.sum(WorkLog.hours))
+        .join(Landman, WorkLog.landman_id == Landman.id)
+        .filter(*date_filter, WorkLog.project_id.isnot(None))
+    )
+    proj_q = _lm(proj_q)
+    proj_q = _pc(proj_q)
+    proj_q = _sc(proj_q)
+    project_hours = round(float(proj_q.scalar() or 0), 2)
+    productivity_percent = round(project_hours / total_hours * 100, 1) if total_hours else 0.0
+
+    return jsonify({
+        "availability": availability,
+        "summary": {
+            "client": summary_client,
+            "state": summary_state,
+            "county": summary_county,
+        },
+        "aoi_hours": aoi_hours,
+        "warnings": warnings,
+        "totals": {
+            "total_hours": round(total_hours, 2),
+            "project_hours": project_hours,
+            "productivity_percent": productivity_percent,
+        },
+    })
 
 
 # ---------------------------------------------------------------------------
